@@ -180,7 +180,7 @@ class LorentzBatchNorm2d(LorentzBatchNorm):
         if momentum is not None:
             self.momentum=momentum
         if self.space_method:
-            x = x.reshape(bs, c, h, w)
+            x = x.permute(bs, c, h, w)
             x_space = x[..., 1:]
             normed_space = self.norm(x_space)
             x_time = ((normed_space ** 2).sum(dim=-1, keepdims=True) + self.c).clamp_min(1e-6).sqrt()
