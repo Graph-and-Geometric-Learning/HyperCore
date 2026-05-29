@@ -18,6 +18,7 @@ from ...nn.linear import LorentzLinear, LorentzCLS
 from ...nn.conv import LorentzLayerNorm, LorentzActivation, LorentzDropout, LorentzNormalization
 from ...manifolds import Lorentz
 from ...nn import LResNet
+from .flash_lorentz_attention import flash_attention_core
 
 class LorentzMultiheadAttention(nn.Module):
     """
@@ -32,7 +33,8 @@ class LorentzMultiheadAttention(nn.Module):
         num_heads (int): Number of attention heads.
         use_weight (bool): Whether to use a trainable value projection (Wv).
         power_k (float): Exponent used in the linear focused approximation.
-        attention_type (str): Either 'full' (self-attention) or 'linear_focused'.
+        attention_type (str): One of 'full' (self-attention), 'linear_focused', or 'flash'
+            (IO-aware full attention, O(N) memory, numerically equal to 'full').
         trans_heads_concat (bool): Whether to concatenate attention heads and linearly transform output.
         normalize (bool): Whether to normalize input queries and keys.
     """
@@ -153,6 +155,36 @@ class LorentzMultiheadAttention(nn.Module):
         else:
             return att_output
 
+    def flash_attention(self, qs, ks, vs, output_attentions=False, mask=None):
+        """
+        Computes Lorentz full attention with the IO-aware flash kernel (O(N) memory).
+
+        Numerically equal to full_attention but never builds the [B, H, N, N] matrix. Falls
+        back to full_attention when attention weights are requested, since flash skips them.
+        """
+        if output_attentions:
+            return self.full_attention(qs, ks, vs, output_attentions=True, mask=mask)
+        # project / normalize as in full_attention
+        qs = self.project(qs)
+        ks = self.project(ks)
+        vs = self.project(vs)
+        if self.normalize:
+            qs = LorentzNormalization(self.manifold)(qs)
+            ks = LorentzNormalization(self.manifold)(ks)
+        att_output = flash_attention_core(
+            qs.transpose(1, 2), ks.transpose(1, 2), vs.transpose(1, 2),
+            c=float(self.manifold.c), scale=self.scale, mask=mask,
+        )  # [B, H, N, D] per-head centroid, no N x N matrix
+        att_output = att_output.transpose(1, 2)  # [B, N, H, D]
+        # head merge, same as full_attention
+        if self.trans_heads_concat:
+            att_output_space = self.final_linear(att_output.reshape(att_output.size(0), att_output.size(1), self.num_heads * self.out_channels))
+            att_output_time = ((att_output_space**2).sum(dim=-1, keepdims=True) + self.manifold.c).sqrt()
+            att_output = torch.cat([att_output_time, att_output_space], dim=-1)
+        else:
+            att_output = self.manifold.lorentzian_centroid(att_output)
+        return att_output
+
     def linear_focus_attention(self, hyp_qs, hyp_ks, hyp_vs, output_attentions=False, mask=None):
             """
             Computes linear focused attention in Lorentz geometry.
@@ -220,6 +252,9 @@ class LorentzMultiheadAttention(nn.Module):
             elif self.attention_type == 'full':
                 attention_output, attn = self.full_attention(
                     query, key, value, output_attentions, mask)
+            elif self.attention_type == 'flash':
+                attention_output, attn = self.flash_attention(
+                    query, key, value, output_attentions, mask)
             else:
                 raise NotImplementedError
         else:
@@ -228,6 +263,9 @@ class LorentzMultiheadAttention(nn.Module):
                     query, key, value, output_attentions, mask)  # [B, N, H, D]
             elif self.attention_type == 'full':
                 attention_output = self.full_attention(
+                    query, key, value, output_attentions, mask)
+            elif self.attention_type == 'flash':
+                attention_output = self.flash_attention(
                     query, key, value, output_attentions, mask)
             else:
                 raise NotImplementedError
