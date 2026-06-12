@@ -18,7 +18,7 @@ from ...nn.linear import LorentzLinear, LorentzCLS
 from ...nn.conv import LorentzLayerNorm, LorentzActivation, LorentzDropout, LorentzNormalization
 from ...manifolds import Lorentz
 from ...nn import LResNet
-from .flash_lorentz_attention import flash_attention_core
+from .flash_lorentz_dispatch import flash_attention_core
 
 class LorentzMultiheadAttention(nn.Module):
     """
