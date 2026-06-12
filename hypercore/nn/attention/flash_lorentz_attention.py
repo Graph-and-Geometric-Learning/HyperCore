@@ -1,4 +1,4 @@
-"""Flash (IO-aware) attention for the Lorentz full attention path. O(N) memory, same result as full_attention."""
+"""Flash (IO-aware) Lorentz attention. Triton forward + backward, O(N) memory."""
 
 import math
 import torch
@@ -12,38 +12,38 @@ except ImportError:
 
 
 def lorentz_self_inner(v):
-    space = v[..., 1:]
-    time = v[..., :1]
-    return (space * space).sum(-1, keepdim=True) - time * time
+    # uses s^2 - t^2 convention (= +c on the hyperboloid)
+    s = v[..., 1:]
+    t = v[..., :1]
+    return (s * s).sum(-1, keepdim=True) - t * t
 
 
 def _reproject(ave, c, eps=1e-15):
-    denom = lorentz_self_inner(ave).abs().clamp_min(eps).sqrt()
-    return math.sqrt(c) * ave / denom
+    d = lorentz_self_inner(ave).abs().clamp_min(eps).sqrt()
+    return math.sqrt(c) * ave / d
 
 
 def flash_lorentz_torch(q, k, v, c, scale, bn=128, mask=None):
+    # differentiable reference: CPU / masked / fallback
     B, H, N, Dt = q.shape
     isc = 2.0 / scale
 
     qn = q.clone()
-    qn[..., 0] = -qn[..., 0]
+    qn[..., 0] = -qn[..., 0]   # Lorentz inner via time-sign flip
 
     o = q.new_zeros(B, H, N, Dt)
     m = q.new_full((B, H, N, 1), float("-inf"))
     l = q.new_zeros(B, H, N, 1)
-    mbool = mask is not None and mask.dtype == torch.bool
+    mb = mask is not None and mask.dtype == torch.bool
 
     for j in range(0, N, bn):
         je = min(j + bn, N)
         kb = k[:, :, j:je]
         vb = v[:, :, j:je]
-
         s = torch.matmul(qn, kb.transpose(-1, -2)) * isc
         if mask is not None:
-            mb = mask[:, :, :, j:je]
-            s = s.masked_fill(mb, float("-inf")) if mbool else s + mb
-
+            mj = mask[:, :, :, j:je]
+            s = s.masked_fill(mj, float("-inf")) if mb else s + mj
         m_new = torch.maximum(m, s.max(dim=-1, keepdim=True).values)
         p = torch.exp(s - m_new)
         a = torch.exp(m - m_new)
@@ -57,117 +57,209 @@ def flash_lorentz_torch(q, k, v, c, scale, bn=128, mask=None):
 if _HAS_TRITON:
 
     @triton.jit
-    def _flash_lorentz_fwd(
-        Q, K, V, O, sm_scale,
-        stride_qh, stride_qn, stride_qd,
-        stride_kh, stride_kn, stride_kd,
-        stride_vh, stride_vn, stride_vd,
-        stride_oh, stride_on, stride_od,
-        N,
-        D: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        start_m = tl.program_id(0)
-        off_h = tl.program_id(1)
+    def _fwd(Q, K, V, O, Lo, sc,
+             sh, sn, sd,
+             N, D: tl.constexpr,
+             BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr):
+        # forward: also stores lse (logsumexp per row) for the backward
+        i = tl.program_id(0)
+        h = tl.program_id(1)
+        offs_m = i * BM + tl.arange(0, BM)
+        offs_d = tl.arange(0, BD)
+        md = offs_d < D
+        mm = offs_m < N
+        base = h * sh
 
-        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        mask_m = offs_m < N
+        qs = tl.load(Q + base + offs_m[:, None] * sn + (1 + offs_d)[None, :] * sd,
+                     mask=mm[:, None] & md[None, :], other=0.0)
+        qt = tl.load(Q + base + offs_m * sn, mask=mm, other=0.0)
 
-        qs = tl.load(
-            Q + off_h * stride_qh + offs_m[:, None] * stride_qn + (1 + offs_d)[None, :] * stride_qd,
-            mask=mask_m[:, None] & mask_d[None, :], other=0.0,
-        )
-        qt = tl.load(Q + off_h * stride_qh + offs_m * stride_qn, mask=mask_m, other=0.0)
+        m_i = tl.full([BM], float("-inf"), tl.float32)
+        l_i = tl.zeros([BM], tl.float32)
+        accs = tl.zeros([BM, BD], tl.float32)
+        acct = tl.zeros([BM], tl.float32)
 
-        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
-        l_i = tl.zeros([BLOCK_M], tl.float32)
-        acc_space = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
-        acc_time = tl.zeros([BLOCK_M], tl.float32)
+        for n0 in range(0, N, BN):
+            offs_n = n0 + tl.arange(0, BN)
+            mn = offs_n < N
+            ks = tl.load(K + base + offs_n[:, None] * sn + (1 + offs_d)[None, :] * sd,
+                         mask=mn[:, None] & md[None, :], other=0.0)
+            vs = tl.load(V + base + offs_n[:, None] * sn + (1 + offs_d)[None, :] * sd,
+                         mask=mn[:, None] & md[None, :], other=0.0)
+            kt = tl.load(K + base + offs_n * sn, mask=mn, other=0.0)
+            vt = tl.load(V + base + offs_n * sn, mask=mn, other=0.0)
 
-        for n0 in range(0, N, BLOCK_N):
-            offs_n = n0 + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < N
-
-            ks = tl.load(
-                K + off_h * stride_kh + offs_n[:, None] * stride_kn + (1 + offs_d)[None, :] * stride_kd,
-                mask=mask_n[:, None] & mask_d[None, :], other=0.0,
-            )
-            vs = tl.load(
-                V + off_h * stride_vh + offs_n[:, None] * stride_vn + (1 + offs_d)[None, :] * stride_vd,
-                mask=mask_n[:, None] & mask_d[None, :], other=0.0,
-            )
-            kt = tl.load(K + off_h * stride_kh + offs_n * stride_kn, mask=mask_n, other=0.0)
-            vt = tl.load(V + off_h * stride_vh + offs_n * stride_vn, mask=mask_n, other=0.0)
-
+            # Lorentz inner via split: space dot - time product
             s = tl.dot(qs, tl.trans(ks)) - qt[:, None] * kt[None, :]
-            s = s * sm_scale
-            s = tl.where(mask_n[None, :], s, float("-inf"))
+            s = s * sc
+            s = tl.where(mn[None, :], s, float("-inf"))
 
             m_new = tl.maximum(m_i, tl.max(s, axis=1))
             p = tl.exp(s - m_new[:, None])
             a = tl.exp(m_i - m_new)
-
             l_i = a * l_i + tl.sum(p, axis=1)
-            acc_space = acc_space * a[:, None] + tl.dot(p.to(vs.dtype), vs)
-            acc_time = acc_time * a + tl.sum(p * vt[None, :], axis=1)
+            accs = accs * a[:, None] + tl.dot(p.to(vs.dtype), vs)
+            acct = acct * a + tl.sum(p * vt[None, :], axis=1)
             m_i = m_new
 
-        acc_space = acc_space / l_i[:, None]
-        acc_time = acc_time / l_i
+        lse = m_i + tl.log(l_i)   # saved for backward
+        accs = accs / l_i[:, None]
+        acct = acct / l_i
 
-        tl.store(
-            O + off_h * stride_oh + offs_m[:, None] * stride_on + (1 + offs_d)[None, :] * stride_od,
-            acc_space, mask=mask_m[:, None] & mask_d[None, :],
-        )
-        tl.store(O + off_h * stride_oh + offs_m * stride_on, acc_time, mask=mask_m)
+        tl.store(O + base + offs_m[:, None] * sn + (1 + offs_d)[None, :] * sd,
+                 accs, mask=mm[:, None] & md[None, :])
+        tl.store(O + base + offs_m * sn, acct, mask=mm)
+        tl.store(Lo + h * N + offs_m, lse, mask=mm)
 
-    _CONFIGS = [
-        dict(block_m=128, block_n=64, num_stages=2, num_warps=4),
-        dict(block_m=64, block_n=64, num_stages=2, num_warps=4),
-        dict(block_m=64, block_n=32, num_stages=2, num_warps=4),
-        dict(block_m=64, block_n=32, num_stages=1, num_warps=4),
-        dict(block_m=32, block_n=32, num_stages=1, num_warps=2),
-    ]
-    _best_config = {}
+    @triton.jit
+    def _bwd_kv(QN, K, V, DO, Lv, Dv, DK, DV, sc,
+                sh, sn, sd,
+                N, Dt: tl.constexpr,
+                BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr):
+        # block over keys, loop queries; recompute P = exp(S - L) from saved L
+        j = tl.program_id(0)
+        h = tl.program_id(1)
+        offs_j = j * BN + tl.arange(0, BN)
+        offs_d = tl.arange(0, BD)
+        mj = offs_j < N
+        md = offs_d < Dt
+        base = h * sh
 
-    def flash_lorentz_triton(q, k, v, c, scale):
+        kb = tl.load(K + base + offs_j[:, None] * sn + offs_d[None, :] * sd,
+                     mask=mj[:, None] & md[None, :], other=0.0)
+        vb = tl.load(V + base + offs_j[:, None] * sn + offs_d[None, :] * sd,
+                     mask=mj[:, None] & md[None, :], other=0.0)
+        dkb = tl.zeros([BN, BD], tl.float32)
+        dvb = tl.zeros([BN, BD], tl.float32)
+
+        for i0 in range(0, N, BM):
+            offs_i = i0 + tl.arange(0, BM)
+            mi = offs_i < N
+            qb = tl.load(QN + base + offs_i[:, None] * sn + offs_d[None, :] * sd,
+                         mask=mi[:, None] & md[None, :], other=0.0)
+            dob = tl.load(DO + base + offs_i[:, None] * sn + offs_d[None, :] * sd,
+                          mask=mi[:, None] & md[None, :], other=0.0)
+            li = tl.load(Lv + h * N + offs_i, mask=mi, other=0.0)
+            di = tl.load(Dv + h * N + offs_i, mask=mi, other=0.0)
+
+            s = tl.dot(qb, tl.trans(kb)) * sc
+            s = tl.where(mj[None, :], s, float("-inf"))
+            p = tl.exp(s - li[:, None])
+            dp = tl.dot(dob, tl.trans(vb))
+            ds = p * (dp - di[:, None]) * sc   # softmax Jacobian
+            dvb += tl.dot(tl.trans(p).to(dob.dtype), dob)
+            dkb += tl.dot(tl.trans(ds).to(qb.dtype), qb)
+
+        tl.store(DK + base + offs_j[:, None] * sn + offs_d[None, :] * sd,
+                 dkb, mask=mj[:, None] & md[None, :])
+        tl.store(DV + base + offs_j[:, None] * sn + offs_d[None, :] * sd,
+                 dvb, mask=mj[:, None] & md[None, :])
+
+    @triton.jit
+    def _bwd_q(QN, K, V, DO, Lv, Dv, DQ, sc,
+               sh, sn, sd,
+               N, Dt: tl.constexpr,
+               BM: tl.constexpr, BN: tl.constexpr, BD: tl.constexpr):
+        # block over queries, loop keys
+        i = tl.program_id(0)
+        h = tl.program_id(1)
+        offs_i = i * BM + tl.arange(0, BM)
+        offs_d = tl.arange(0, BD)
+        mi = offs_i < N
+        md = offs_d < Dt
+        base = h * sh
+
+        qb = tl.load(QN + base + offs_i[:, None] * sn + offs_d[None, :] * sd,
+                     mask=mi[:, None] & md[None, :], other=0.0)
+        dob = tl.load(DO + base + offs_i[:, None] * sn + offs_d[None, :] * sd,
+                      mask=mi[:, None] & md[None, :], other=0.0)
+        li = tl.load(Lv + h * N + offs_i, mask=mi, other=0.0)
+        di = tl.load(Dv + h * N + offs_i, mask=mi, other=0.0)
+        dqb = tl.zeros([BM, BD], tl.float32)
+
+        for j0 in range(0, N, BN):
+            offs_j = j0 + tl.arange(0, BN)
+            mj = offs_j < N
+            kb = tl.load(K + base + offs_j[:, None] * sn + offs_d[None, :] * sd,
+                         mask=mj[:, None] & md[None, :], other=0.0)
+            vb = tl.load(V + base + offs_j[:, None] * sn + offs_d[None, :] * sd,
+                         mask=mj[:, None] & md[None, :], other=0.0)
+            s = tl.dot(qb, tl.trans(kb)) * sc
+            s = tl.where(mj[None, :], s, float("-inf"))
+            p = tl.exp(s - li[:, None])
+            dp = tl.dot(dob, tl.trans(vb))
+            ds = p * (dp - di[:, None]) * sc
+            dqb += tl.dot(ds.to(kb.dtype), kb)
+
+        tl.store(DQ + base + offs_i[:, None] * sn + offs_d[None, :] * sd,
+                 dqb, mask=mi[:, None] & md[None, :])
+
+    def _fwd_run(q, k, v, scale):
         B, H, N, Dt = q.shape
         D = Dt - 1
-
         q2 = q.reshape(B * H, N, Dt).contiguous()
         k2 = k.reshape(B * H, N, Dt).contiguous()
         v2 = v.reshape(B * H, N, Dt).contiguous()
-        out = torch.empty_like(q2)
+        o = torch.empty_like(q2)
+        lse = torch.empty(B * H, N, device=q.device, dtype=torch.float32)
+        bd = triton.next_power_of_2(D)
+        sc = 2.0 / scale
+        BM = BN = 64
+        grid = (triton.cdiv(N, BM), B * H)
+        _fwd[grid](q2, k2, v2, o, lse, sc,
+                   q2.stride(0), q2.stride(1), q2.stride(2),
+                   N, D, BM=BM, BN=BN, BD=bd)
+        return o.reshape(B, H, N, Dt), lse.reshape(B, H, N, 1)
 
-        block_d = triton.next_power_of_2(D)
-        sm_scale = 2.0 / scale
+    def _bwd_run(qn, k, v, do, lse, dvec, scale):
+        B, H, N, Dt = qn.shape
+        M = B * H
+        qn2 = qn.reshape(M, N, Dt).contiguous()
+        k2 = k.reshape(M, N, Dt).contiguous()
+        v2 = v.reshape(M, N, Dt).contiguous()
+        do2 = do.reshape(M, N, Dt).contiguous()
+        l2 = lse.reshape(M, N).contiguous()
+        d2 = dvec.reshape(M, N).contiguous()
+        dk = torch.zeros_like(k2)
+        dv = torch.zeros_like(v2)
+        dq = torch.zeros_like(qn2)
+        sc = 2.0 / scale
+        bd = triton.next_power_of_2(Dt)
+        BM = BN = 16   # small block to fit shared memory on T4
+        _bwd_kv[(triton.cdiv(N, BN), M)](qn2, k2, v2, do2, l2, d2, dk, dv, sc,
+                                         qn2.stride(0), qn2.stride(1), qn2.stride(2),
+                                         N, Dt, BM=BM, BN=BN, BD=bd)
+        _bwd_q[(triton.cdiv(N, BM), M)](qn2, k2, v2, do2, l2, d2, dq, sc,
+                                        qn2.stride(0), qn2.stride(1), qn2.stride(2),
+                                        N, Dt, BM=BM, BN=BN, BD=bd)
+        return dq.reshape(B, H, N, Dt), dk.reshape(B, H, N, Dt), dv.reshape(B, H, N, Dt)
 
-        configs = [_best_config[Dt]] if Dt in _best_config else _CONFIGS
-        for cfg in configs:
-            try:
-                grid = (triton.cdiv(N, cfg["block_m"]), B * H)
-                _flash_lorentz_fwd[grid](
-                    q2, k2, v2, out, sm_scale,
-                    q2.stride(0), q2.stride(1), q2.stride(2),
-                    k2.stride(0), k2.stride(1), k2.stride(2),
-                    v2.stride(0), v2.stride(1), v2.stride(2),
-                    out.stride(0), out.stride(1), out.stride(2),
-                    N, D,
-                    BLOCK_M=cfg["block_m"], BLOCK_N=cfg["block_n"], BLOCK_D=block_d,
-                    num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
-                )
-                _best_config[Dt] = cfg
-                return _reproject(out.reshape(B, H, N, Dt), c)
-            except triton.runtime.errors.OutOfResources:
-                continue
-        raise RuntimeError("no Triton block config fit in shared memory")
+    class _FlashFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, q, k, v, scale):
+            o, lse = _fwd_run(q, k, v, scale)
+            ctx.save_for_backward(q, k, v, o, lse)
+            ctx.scale = float(scale)
+            return o
+
+        @staticmethod
+        def backward(ctx, do):
+            q, k, v, o, lse = ctx.saved_tensors
+            sc = ctx.scale
+            dvec = (do * o).sum(-1, keepdim=True)
+            qn = q.clone()
+            qn[..., 0] = -qn[..., 0]
+            dq, dk, dv = _bwd_run(qn, k, v, do, lse, dvec, sc)
+            dq[..., 0] = -dq[..., 0]   # undo the time-sign flip on dq
+            return dq, dk, dv, None
+
+    def flash_lorentz_triton(q, k, v, c, scale):
+        o = _FlashFn.apply(q, k, v, float(scale))
+        return _reproject(o, c)
 
 
 def flash_attention_core(q, k, v, c, scale, mask=None):
-    if _HAS_TRITON and q.is_cuda and mask is None and not torch.is_grad_enabled():
-        return flash_lorentz_triton(q, k, v, c, float(scale))
+    # Triton for CUDA without mask; torch fallback otherwise
+    if _HAS_TRITON and q.is_cuda and mask is None:
+        return flash_lorentz_triton(q, k, v, c, scale)
     return flash_lorentz_torch(q, k, v, c, scale, mask=mask)

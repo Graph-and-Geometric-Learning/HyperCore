@@ -1,41 +1,36 @@
-"""
-Benchmark flash/full Lorentz attention on cuda gpu
-"""
-import argparse
+"""Benchmark train step (forward + backward): full vs flash on cuda."""
 import statistics
-
 import torch
 
-from hypercore.manifolds import Lorentz
-from hypercore.nn.attention.lorentz_former_conv import LorentzMultiheadAttention
+from hypercore.nn.attention.flash_lorentz_attention import flash_attention_core, _reproject
 
 
-def time_ms(fn, iters=100, warmup=20):
+def full_ref(q, k, v, scale):
+    isc = 2.0 / scale
+    qn = torch.cat([-q[..., :1], q[..., 1:]], dim=-1)
+    s = torch.matmul(qn, k.transpose(-1, -2)) * isc
+    p = torch.softmax(s, dim=-1)
+    o = torch.matmul(p, v)
+    return _reproject(o, 1.0)
+
+
+def time_ms(fn, iters=30, warmup=10):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-
-    samples = []
+    ts = []
     for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.cuda.synchronize()
-        samples.append(start.elapsed_time(end))
-
-    samples.sort()
-    return statistics.median(samples), samples[0], samples[-1]
+        a = torch.cuda.Event(enable_timing=True); b = torch.cuda.Event(enable_timing=True)
+        a.record(); fn(); b.record(); torch.cuda.synchronize()
+        ts.append(a.elapsed_time(b))
+    ts.sort()
+    return statistics.median(ts)
 
 
-def peak_memory_mb(fn):
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
+def peak_mb(fn):
+    torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
     try:
-        fn()
-        torch.cuda.synchronize()
+        fn(); torch.cuda.synchronize()
         return torch.cuda.max_memory_allocated() / 1e6
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
@@ -43,68 +38,41 @@ def peak_memory_mb(fn):
         raise
 
 
+def step_fn(kind, q, k, v, scale):
+    def step():
+        for t in (q, k, v):
+            if t.grad is not None:
+                t.grad = None
+        out = full_ref(q, k, v, scale) if kind == "full" else flash_attention_core(q, k, v, 1.0, scale)
+        out.pow(2).sum().backward()
+    return step
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seq-lens", type=int, nargs="+", default=[1024, 2048, 4096, 8192, 16384])
-    parser.add_argument("--configs", type=str, default="8x64,12x64,4x32", help="heads x dim")
-    parser.add_argument("--iters", type=int, default=100)
-    args = parser.parse_args()
-
     assert torch.cuda.is_available(), "needs cuda gpu"
-    device = "cuda"
-    manifold = Lorentz(c=1.0)
     print("device:", torch.cuda.get_device_name(0))
+    H, D = 8, 64
+    Dt = D + 1
+    scale = float(H * Dt) ** 0.5
+    print(f"\nH={H}, D={D}  (train step: fwd + bwd)")
+    print("N|full ms|flash ms|full MB|flash MB|memx")
 
-    print("correctness:")
-    for concat in (False, True):
+    for N in [512, 1024, 2048, 4096, 8192]:
         torch.manual_seed(0)
-        layer = LorentzMultiheadAttention(
-            manifold, 16, 65, 8, attention_type="full", trans_heads_concat=concat,
-        ).to(device)
-        x = torch.randn(2, 256, layer.num_heads * layer.in_channels, device=device)
-        with torch.no_grad():
-            out_full = layer(x, x)
-            layer.attention_type = "flash"
-            out_flash = layer(x, x)
-        err = (out_full - out_flash).abs().max().item()
-        print(f"concat={concat} max abs error = {err:.2e}")
+        q = torch.randn(1, H, N, Dt, device="cuda", requires_grad=True)
+        k = torch.randn(1, H, N, Dt, device="cuda", requires_grad=True)
+        v = torch.randn(1, H, N, Dt, device="cuda", requires_grad=True)
 
-    for spec in args.configs.split(","):
-        heads, dim = (int(t) for t in spec.lower().split("x"))
-        torch.manual_seed(0)
-        layer = LorentzMultiheadAttention(manifold, 16, dim + 1, heads, attention_type="full", trans_heads_concat=True)
-        layer = layer.to(device)
-        feat = layer.num_heads * layer.in_channels
+        mf = peak_mb(step_fn("full", q, k, v, scale))
+        ms = peak_mb(step_fn("flash", q, k, v, scale))
+        tf = time_ms(step_fn("full", q, k, v, scale)) if mf > 0 else -1
+        ts = time_ms(step_fn("flash", q, k, v, scale)) if ms > 0 else -1
 
-        print(f"\nH={heads}, D={dim}", "N|full ms|flash ms|speedup|full MB|flash MB|memx", sep='\n')
-
-        for N in args.seq_lens:
-            x = torch.randn(1, N, feat, device=device)
-
-            def run_full():
-                layer.attention_type = "full"
-                with torch.no_grad():
-                    return layer(x, x)
-
-            def run_flash():
-                layer.attention_type = "flash"
-                with torch.no_grad():
-                    return layer(x, x)
-
-            mem_full = peak_memory_mb(run_full)
-            mem_flash = peak_memory_mb(run_flash)
-
-            if mem_full < 0:  # baseline OOM, flash still runs
-                mf, lo, hi = time_ms(run_flash, iters=args.iters)
-                print(f"{N}|OOM|{mf:.2f} ({lo:.2f}-{hi:.2f})|--|OOM|{mem_flash:.1f}|inf")
-            else:
-                mo, lo_o, hi_o = time_ms(run_full, iters=args.iters)
-                mf, lo_f, hi_f = time_ms(run_flash, iters=args.iters)
-                print(f"{N}|{mo:.2f} ({lo_o:.2f}-{hi_o:.2f})|{mf:.2f} ({lo_f:.2f}-{hi_f:.2f})|"
-                      f"{mo / mf:.2f}x|{mem_full:.1f}|{mem_flash:.1f}|{mem_full / mem_flash:.1f}x")
-
-            del x
-            torch.cuda.empty_cache()
+        def s(x): return f"{x:.1f}" if x > 0 else "OOM"
+        memx = f"{mf / ms:.1f}x" if (mf > 0 and ms > 0) else "--"
+        print(f"{N}|{s(tf)}|{s(ts)}|{s(mf)}|{s(ms)}|{memx}")
+        del q, k, v
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
