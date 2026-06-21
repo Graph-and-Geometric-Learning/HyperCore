@@ -86,12 +86,16 @@ def _patch_phi():
     s = s.replace('from .flash_lorentz_dispatch import flash_attention_core',
                   'from .flash_lorentz_dispatch import flash_attention_core\n'
                   'from .linear_focus_attention_v3 import phi as _phi_v3')
-    old = ("            phi_qs = (F.relu(qs) + 1e-6) / (self.norm_scale.abs() + 1e-6)  # [B, N, H, D]\n"
-           "            phi_ks = (F.relu(ks) + 1e-6) / (self.norm_scale.abs() + 1e-6)  # [B, N, H, D]\n\n"
-           "            phi_qs = self.fp(phi_qs, p=self.power_k)  # [B, N, H, D]\n"
-           "            phi_ks = self.fp(phi_ks, p=self.power_k)  # [B, N, H, D]")
-    new = ("            phi_qs = _phi_v3(qs, self.norm_scale, p=self.power_k)  # [B, N, H, D]\n"
-           "            phi_ks = _phi_v3(ks, self.norm_scale, p=self.power_k)  # [B, N, H, D]")
+    old = (
+        "phi_qs = (F.relu(qs) + 1e-6) / (self.norm_scale.abs() + 1e-6)  # [B, N, H, D]\n"
+        "phi_ks = (F.relu(ks) + 1e-6) / (self.norm_scale.abs() + 1e-6)  # [B, N, H, D]\n\n"
+        "phi_qs = self.fp(phi_qs, p=self.power_k)  # [B, N, H, D]\n"
+        "phi_ks = self.fp(phi_ks, p=self.power_k)  # [B, N, H, D]"
+    )
+    new = (
+        "phi_qs = _phi_v3(qs, self.norm_scale, p=self.power_k)  # [B, N, H, D]\n"
+        "phi_ks = _phi_v3(ks, self.norm_scale, p=self.power_k)  # [B, N, H, D]"
+    )
     s = s.replace(old, new); open(fp, 'w').write(s)
 
 # ---- linear_focused swap + dim workaround ----
@@ -99,8 +103,7 @@ def swap_lf(model, man):
     LMA = sys.modules['hypercore.nn'].LorentzMultiheadAttention
     for blk in model.encoder.blocks:
         a = blk.attention
-        blk.attention = LMA(man, a.in_channels, a.out_channels, a.num_heads,
-                            attention_type='linear_focused', trans_heads_concat=True).to(dev)
+        blk.attention = LMA(man, a.in_channels, a.out_channels, a.num_heads, attention_type='linear_focused', trans_heads_concat=True).to(dev)
     return model
 
 def _lf_fixed(self, hq, hk, hv, output_attentions=False, mask=None):
@@ -129,9 +132,11 @@ def patch_dims(model):
 # ---- model build ----
 def build(LViT, man_in, man_h, man_out, use_kernel):
     torch.manual_seed(0)
-    m = LViT(man_in, man_h, man_out, image_size=32, patch_size=4, num_layers=6,
-             in_channel=3, hidden_channel=33, out_channel=10, mlp_hidden_size=33 * 4,
-             num_heads=8, dropout=0.1).to(dev)
+    m = LViT(
+        man_in, man_h, man_out, image_size=32, patch_size=4, num_layers=6,
+        in_channel=3, hidden_channel=33, out_channel=10, mlp_hidden_size=33 * 4,
+        num_heads=8, dropout=0.1
+    ).to(dev)
     m = patch_dims(swap_lf(m, man_h))
     _LF3._HAS_TRITON = use_kernel
     return m
@@ -141,10 +146,12 @@ def loaders(bs=128):
     tt = transforms.Compose([
         transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))])
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+    ])
     tv = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))])
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+    ])
     root = os.environ.get('DATA_ROOT', '/kaggle/working/cifar')
     tr = datasets.CIFAR10(root, train=True, download=True, transform=tt)
     va = datasets.CIFAR10(root, train=False, download=True, transform=tv)
